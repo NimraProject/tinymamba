@@ -12,6 +12,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import gc
 import time
+import copy
 
 # Try to import optional dependencies
 try:
@@ -880,16 +881,38 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     # Get dimensions
     q_dim = q.shape[-1]
     
+    # Validate input dimensions for clear error messages
+    if q.shape != k.shape:
+        raise ValueError(
+            f"Query and key shapes must match, but got q={q.shape} and k={k.shape}. "
+            f"Check head dimensions and model configuration."
+        )
+    
     # Check if cos and sin already have batch and head dimensions
     if cos.ndim == 2:
         # Raw cos and sin from RotaryEmbedding
         # Ensure head_dim matches by truncating if necessary
+        if cos.shape[-1] < q_dim:
+            raise ValueError(
+                f"Rotary embeddings dimension ({cos.shape[-1]}) smaller than query dimension ({q_dim}). "
+                f"Please increase the RoPE embedding size in RotaryEmbedding class."
+            )
         cos = cos[:, :q_dim].unsqueeze(0).unsqueeze(0)
         sin = sin[:, :q_dim].unsqueeze(0).unsqueeze(0)
     elif cos.ndim == 4:
         # Already has batch and head dimensions, just ensure head_dim matches
+        if cos.shape[-1] < q_dim:
+            raise ValueError(
+                f"Rotary embeddings dimension ({cos.shape[-1]}) smaller than query dimension ({q_dim}). "
+                f"Please increase the RoPE embedding size in RotaryEmbedding class."
+            )
         cos = cos[..., :q_dim]
         sin = sin[..., :q_dim]
+    else:
+        raise ValueError(
+            f"Unexpected shape for rotary embeddings: cos={cos.shape}, sin={sin.shape}. "
+            f"Expected either 2D [seq_len, dim] or 4D [batch, heads, seq_len, dim]."
+        )
     
     # Split values into even and odd for rotation
     q_even = q[..., 0::2]
@@ -900,19 +923,35 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     # Make sure dimensions match between tensors before operations
     # Get half dimension for proper reshaping
     half_dim = q_dim // 2
+    
+    # Validate dimensions are as expected
+    if q_even.shape[-1] != half_dim or q_odd.shape[-1] != half_dim:
+        raise ValueError(
+            f"Query has uneven dimensions when split, got even={q_even.shape}, odd={q_odd.shape}. "
+            f"Query dimension ({q_dim}) must be even for RoPE."
+        )
+    
     cos_half = cos[..., :half_dim]
     sin_half = sin[..., :half_dim]
     
     # Apply rotation using elementwise operations for proper broadcasting
-    q_embed = torch.cat([
-        q_even * cos_half - q_odd * sin_half,
-        q_odd * cos_half + q_even * sin_half
-    ], dim=-1)
-    
-    k_embed = torch.cat([
-        k_even * cos_half - k_odd * sin_half,
-        k_odd * cos_half + k_even * sin_half
-    ], dim=-1)
+    try:
+        q_embed = torch.cat([
+            q_even * cos_half - q_odd * sin_half,
+            q_odd * cos_half + q_even * sin_half
+        ], dim=-1)
+        
+        k_embed = torch.cat([
+            k_even * cos_half - k_odd * sin_half,
+            k_odd * cos_half + k_even * sin_half
+        ], dim=-1)
+    except RuntimeError as e:
+        # Provide more context in case of operation failures
+        raise RuntimeError(
+            f"Failed to apply rotary embeddings due to dimension mismatch: {e}. "
+            f"Shapes: q_even={q_even.shape}, q_odd={q_odd.shape}, "
+            f"cos_half={cos_half.shape}, sin_half={sin_half.shape}"
+        ) from e
     
     return q_embed, k_embed
 
@@ -2766,52 +2805,262 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, val_loss, c
 
 
 def generate_and_log_samples(generator, logger, global_step, prompts=None):
-    """Generate and log text samples"""
-    if generator is None:
-        return
-        
-    # Default prompts if none provided
+    """Generate and log text samples during training"""
     if prompts is None:
         prompts = [
             "Once upon a time",
             "The meaning of life is",
-            "In the distant future",
+            "In the future, artificial intelligence will",
             "The best way to learn is"
         ]
+        
+    # Log multiple generations with different prompts
+    generated_samples = []
+    for prompt in prompts:
+        try:
+            generated = generator.generate(prompt_text=prompt)
+            generated_samples.append(f"Prompt: {prompt}\n\n{generated}")
+        except Exception as e:
+            print(f"Error generating from prompt '{prompt}': {e}")
+            generated_samples.append(f"Prompt: {prompt}\n\n[Generation failed: {e}]")
     
-    # Generate samples
-    model = generator.model
-    model.eval()
+    # Log samples to tracking tool
+    for i, sample in enumerate(generated_samples):
+        logger.log_generated_text(
+            step=global_step,
+            epoch=-1,  # Not tied to specific epoch
+            text=sample,
+            tag=f"generation/sample_{i+1}"
+        )
     
-    samples = []
-    with torch.no_grad():
-        for prompt in prompts:
-            try:
-                output = generator.generate(prompt_text=prompt)
-                samples.append({
-                    "prompt": prompt,
-                    "generated": output
-                })
+    # Print the first sample to console
+    if len(generated_samples) > 0:
+        print(f"\n{'-'*40}\nGenerated Sample:\n{generated_samples[0]}\n{'-'*40}")
+        
+    return generated_samples
+
+# --- Model Quantization Support ---
+
+class QuantizedModelSupport:
+    """
+    Utility class for quantizing TinyMamba models to INT8 and INT4 formats
+    for more efficient deployment on resource-constrained devices.
+    """
+    
+    @staticmethod
+    def quantize_to_int8(model, calibration_data=None, device='cpu'):
+        """
+        Quantize model to INT8 precision using PyTorch's quantization API.
+        
+        Args:
+            model: The TinyMamba model to quantize
+            calibration_data: Optional data for calibration (list of tensors)
+            device: Target device for the quantized model
+            
+        Returns:
+            Quantized model in INT8 precision
+        """
+        try:
+            import torch.quantization as quantization
+        except ImportError:
+            raise ImportError(
+                "PyTorch quantization module not available. "
+                "Please use PyTorch 1.8.0+ with quantization support."
+            )
+        
+        # Prepare the model for static quantization
+        model.eval()
+        
+        # Create a quantization configuration
+        qconfig = quantization.get_default_qconfig('fbgemm' if device == 'cpu' else 'qnnpack')
+        
+        # Prepare the model for quantization
+        quantization.prepare(model, inplace=True)
+        
+        # Calibrate the model if calibration data is provided
+        if calibration_data is not None:
+            with torch.no_grad():
+                for data in calibration_data:
+                    if isinstance(data, list) or isinstance(data, tuple):
+                        # If data contains multiple inputs
+                        model(*data)
+                    else:
+                        # If data is just the input tensor
+                        model(data)
+        
+        # Convert to quantized model
+        quantization.convert(model, inplace=True)
+        
+        print(f"Model successfully quantized to INT8")
+        return model
+    
+    @staticmethod
+    def quantize_to_int4(model, device='cpu'):
+        """
+        Quantize model to INT4 precision (requires PyTorch 2.0+ or specialized libraries).
+        
+        Args:
+            model: The TinyMamba model to quantize
+            device: Target device for the quantized model
+            
+        Returns:
+            Quantized model in INT4 precision
+        """
+        try:
+            # Check if we have the bitsandbytes library for INT4 quantization
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError(
+                "INT4 quantization requires bitsandbytes library. "
+                "Please install with: pip install bitsandbytes>=0.39.0"
+            )
+        
+        # Put model in eval mode
+        model.eval()
+        model = model.to(device)
+        
+        # Convert Linear layers to 4-bit quantized versions
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                parent_name = '.'.join(name.split('.')[:-1])
+                module_name = name.split('.')[-1]
                 
-                # Log to tensorboard/etc.
-                if logger:
-                    logger.log_generated_text(
-                        global_step,
-                        f"Prompt: {prompt}\n\n{output}",
-                        tag=f"generation/{prompt[:10]}"
+                if parent_name:
+                    parent = model.get_submodule(parent_name)
+                    # Replace with 4-bit quantized version
+                    setattr(
+                        parent, 
+                        module_name, 
+                        bnb.nn.Linear4bit(
+                            module.in_features,
+                            module.out_features,
+                            bias=module.bias is not None,
+                            compute_dtype=torch.float16
+                        )
                     )
-            except Exception as e:
-                print(f"Error generating from prompt '{prompt}': {e}")
+                else:
+                    # Top-level module
+                    setattr(
+                        model, 
+                        module_name, 
+                        bnb.nn.Linear4bit(
+                            module.in_features,
+                            module.out_features,
+                            bias=module.bias is not None,
+                            compute_dtype=torch.float16
+                        )
+                    )
+        
+        print(f"Model successfully quantized to INT4")
+        return model
     
-    # Print a sample to console
-    if samples and logger:
-        print(f"\n--- Generated Sample at Step {global_step} ---")
-        print(f"Prompt: {samples[0]['prompt']}")
-        print(f"Generated: {samples[0]['generated'][:200]}...")
-        print("---------------------------------------------\n")
+    @staticmethod
+    def benchmark_quantized_model(original_model, quantized_model, input_data, num_runs=100):
+        """
+        Benchmark the performance of the original vs quantized model.
+        
+        Args:
+            original_model: The original full-precision model
+            quantized_model: The quantized model (INT8 or INT4)
+            input_data: Input tensor or batch for inference
+            num_runs: Number of inference runs for benchmarking
+            
+        Returns:
+            Dictionary with benchmark results
+        """
+        import time
+        
+        results = {}
+        
+        # Move models to evaluation mode
+        original_model.eval()
+        quantized_model.eval()
+        
+        # Original model benchmark
+        start_time = time.time()
+        with torch.no_grad():
+            for _ in range(num_runs):
+                original_model(input_data)
+        original_time = (time.time() - start_time) / num_runs
+        
+        # Quantized model benchmark
+        start_time = time.time()
+        with torch.no_grad():
+            for _ in range(num_runs):
+                quantized_model(input_data)
+        quantized_time = (time.time() - start_time) / num_runs
+        
+        # Calculate memory usage
+        original_size = sum(p.numel() * p.element_size() for p in original_model.parameters()) / (1024 * 1024)
+        quantized_size = sum(p.numel() * (p.element_size() if hasattr(p, 'element_size') else 4) 
+                           for p in quantized_model.parameters()) / (1024 * 1024)
+        
+        # Compile results
+        results['original_inference_time_ms'] = original_time * 1000
+        results['quantized_inference_time_ms'] = quantized_time * 1000
+        results['speedup'] = original_time / quantized_time
+        results['original_size_mb'] = original_size
+        results['quantized_size_mb'] = quantized_size
+        results['size_reduction'] = original_size / quantized_size
+        
+        print(f"\nBenchmark Results:")
+        print(f"Original model: {results['original_inference_time_ms']:.2f} ms per inference, size: {results['original_size_mb']:.2f} MB")
+        print(f"Quantized model: {results['quantized_inference_time_ms']:.2f} ms per inference, size: {results['quantized_size_mb']:.2f} MB")
+        print(f"Speedup: {results['speedup']:.2f}x, Size reduction: {results['size_reduction']:.2f}x")
+        
+        return results
+
+def export_quantized_model(model, save_path, quantization_type='int8', calibration_data=None, device='cpu'):
+    """
+    Export a quantized version of the TinyMamba model for efficient deployment.
     
-    model.train()
-    return samples
+    Args:
+        model: The TinyMamba model to quantize and export
+        save_path: Path to save the quantized model
+        quantization_type: Type of quantization ('int8' or 'int4')
+        calibration_data: Optional data for calibration (for INT8)
+        device: Target device for the quantized model
+        
+    Returns:
+        Path to the saved quantized model
+    """
+    print(f"Exporting {quantization_type.upper()} quantized model...")
+    
+    # Create a copy of the model for quantization
+    model_copy = copy.deepcopy(model)
+    model_copy.eval()
+    
+    # Perform quantization based on requested type
+    if quantization_type.lower() == 'int8':
+        quantized_model = QuantizedModelSupport.quantize_to_int8(
+            model_copy, 
+            calibration_data=calibration_data,
+            device=device
+        )
+    elif quantization_type.lower() == 'int4':
+        quantized_model = QuantizedModelSupport.quantize_to_int4(
+            model_copy,
+            device=device
+        )
+    else:
+        raise ValueError(f"Unsupported quantization type: {quantization_type}. Use 'int8' or 'int4'.")
+    
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    
+    # Save the quantized model
+    torch.save({
+        'model_state_dict': quantized_model.state_dict(),
+        'config': {
+            'd_model': model.config.d_model,
+            'n_layer': model.config.n_layer,
+            'vocab_size': model.config.vocab_size,
+            'quantization_type': quantization_type
+        }
+    }, save_path)
+    
+    print(f"Quantized model saved to {save_path}")
+    return save_path
 
 
 if __name__ == "__main__":

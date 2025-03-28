@@ -14,10 +14,11 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import time
+import copy
 from tqdm import tqdm
 
 # Import model architecture from the training script
-from testv2 import TinyMambaModel, Config, TextGenerator, SimpleTokenizer
+from testv2 import TinyMambaModel, Config, TextGenerator, SimpleTokenizer, TinyBPETokenizer, QuantizedModelSupport, export_quantized_model
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Export TinyMamba model for deployment")
@@ -37,13 +38,26 @@ def parse_args():
         "--format", 
         type=str, 
         default="all",
-        choices=["pytorch", "torchscript", "onnx", "all"],
+        choices=["pytorch", "torchscript", "onnx", "quantized", "all"],
         help="Export format(s)"
     )
     parser.add_argument(
         "--optimize", 
         action="store_true",
         help="Apply optimization passes to the model"
+    )
+    parser.add_argument(
+        "--quantize", 
+        type=str,
+        choices=["int8", "int4", "both", "none"],
+        default="none",
+        help="Quantize the model to INT8 or INT4 format for efficient deployment"
+    )
+    parser.add_argument(
+        "--calibration_data", 
+        type=str,
+        default=None,
+        help="Path to calibration data for INT8 quantization (jsonl format with 'text' field)"
     )
     parser.add_argument(
         "--batch_size", 
@@ -73,6 +87,11 @@ def parse_args():
         "--verify", 
         action="store_true",
         help="Verify exported model with sample input"
+    )
+    parser.add_argument(
+        "--benchmark", 
+        action="store_true",
+        help="Run benchmark comparing original and quantized models"
     )
     parser.add_argument(
         "--generate", 
@@ -335,40 +354,208 @@ def generate_text(model, config, device, prompt="Once upon a time", max_length=1
     print(result["text"])
     print("-" * 40)
 
+def load_calibration_data(data_path, tokenizer, max_samples=100, device="cpu"):
+    """
+    Load calibration data for INT8 quantization
+    """
+    import json
+    
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Calibration data not found at {data_path}")
+    
+    print(f"Loading calibration data from {data_path}")
+    
+    samples = []
+    with open(data_path, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            if i >= max_samples:
+                break
+            
+            try:
+                item = json.loads(line.strip())
+                if 'text' in item:
+                    text = item['text']
+                    # Tokenize text
+                    tokens = tokenizer.encode(text, return_tensors="pt").to(device)
+                    # Limit sequence length
+                    if tokens.size(1) > 512:
+                        tokens = tokens[:, :512]
+                    samples.append(tokens)
+            except Exception as e:
+                print(f"Error processing calibration sample {i}: {e}")
+    
+    print(f"Loaded {len(samples)} calibration samples")
+    return samples
+
+def export_quantized(model, config, output_dir, quantize_type, calibration_data=None, device="cpu"):
+    """
+    Export model in quantized format (INT8 or INT4)
+    
+    Args:
+        model: The model to quantize
+        config: Model configuration
+        output_dir: Directory to save quantized model
+        quantize_type: Quantization format ('int8', 'int4', or 'both')
+        calibration_data: Optional calibration data for INT8 quantization
+        device: Target device
+    """
+    print(f"Exporting quantized model in {quantize_type} format...")
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Export in INT8 format
+    if quantize_type in ["int8", "both"]:
+        int8_path = os.path.join(output_dir, "tinymamba_model_int8.pt")
+        export_quantized_model(
+            model, 
+            int8_path, 
+            quantization_type='int8',
+            calibration_data=calibration_data,
+            device=device
+        )
+    
+    # Export in INT4 format
+    if quantize_type in ["int4", "both"]:
+        int4_path = os.path.join(output_dir, "tinymamba_model_int4.pt")
+        try:
+            export_quantized_model(
+                model, 
+                int4_path, 
+                quantization_type='int4',
+                device=device
+            )
+        except ImportError as e:
+            print(f"Warning: INT4 quantization failed - {e}")
+            print("Install bitsandbytes library for INT4 support: pip install bitsandbytes>=0.39.0")
+    
+    print(f"Quantized model(s) exported to {output_dir}")
+
+def benchmark_models(original_model, config, output_dir, device, quantize_type, batch_size=1, seq_length=128):
+    """
+    Benchmark performance of original vs quantized models
+    """
+    print("\nRunning performance benchmark...")
+    
+    # Load quantized models
+    quantized_models = {}
+    
+    # Prepare input data for benchmarking
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_length), device=device)
+    
+    # Original model
+    original_model.eval()
+    original_model.to(device)
+    
+    # INT8 quantized model
+    if quantize_type in ["int8", "both"] and os.path.exists(os.path.join(output_dir, "tinymamba_model_int8.pt")):
+        try:
+            int8_model = copy.deepcopy(original_model)
+            int8_model = QuantizedModelSupport.quantize_to_int8(int8_model, device=device)
+            quantized_models["INT8"] = int8_model
+            
+            # Run benchmark
+            print("\nBenchmarking INT8 model:")
+            QuantizedModelSupport.benchmark_quantized_model(
+                original_model, int8_model, input_ids, num_runs=50
+            )
+        except Exception as e:
+            print(f"Error benchmarking INT8 model: {e}")
+    
+    # INT4 quantized model
+    if quantize_type in ["int4", "both"] and os.path.exists(os.path.join(output_dir, "tinymamba_model_int4.pt")):
+        try:
+            int4_model = copy.deepcopy(original_model)
+            int4_model = QuantizedModelSupport.quantize_to_int4(int4_model, device=device)
+            quantized_models["INT4"] = int4_model
+            
+            # Run benchmark
+            print("\nBenchmarking INT4 model:")
+            QuantizedModelSupport.benchmark_quantized_model(
+                original_model, int4_model, input_ids, num_runs=50
+            )
+        except Exception as e:
+            print(f"Error benchmarking INT4 model: {e}")
+    
+    return quantized_models
+
 def main():
+    # Parse command line arguments
     args = parse_args()
     
-    # Create output directory
+    # Create output directories
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Load model and config
+    # Set up output directories for each format
+    pytorch_dir = os.path.join(args.output_dir, "pytorch")
+    torchscript_dir = os.path.join(args.output_dir, "torchscript") 
+    onnx_dir = os.path.join(args.output_dir, "onnx")
+    quantized_dir = os.path.join(args.output_dir, "quantized")
+    
+    # Load model from checkpoint
     model, config = load_checkpoint(args.checkpoint, args.device)
     
-    # Apply optimization if requested
+    # Apply optimization passes if requested
     if args.optimize:
         model = optimize_model(model)
     
-    # Set model to eval mode
-    model.eval()
+    # Initialize tokenizer for text generation or calibration
+    tokenizer = None
+    calibration_data = None
     
-    # Export model in requested format(s)
+    if args.generate or args.calibration_data:
+        try:
+            tokenizer = TinyBPETokenizer(vocab_file=args.vocab_file)
+        except Exception as e:
+            print(f"Warning: Failed to load tokenizer: {e}")
+            print("Text generation might not work correctly.")
+    
+    # Load calibration data if provided and tokenizer is available
+    if args.calibration_data and tokenizer and args.quantize in ["int8", "both"]:
+        calibration_data = load_calibration_data(args.calibration_data, tokenizer, device=args.device)
+    
+    # Export in requested formats
     if args.format in ["pytorch", "all"]:
-        export_pytorch(model, config, os.path.join(args.output_dir, "pytorch"))
-        
+        export_pytorch(model, config, pytorch_dir)
+    
     if args.format in ["torchscript", "all"]:
-        export_torchscript(model, config, os.path.join(args.output_dir, "torchscript"), 
-                         args.batch_size, args.seq_length, args.device)
-        
+        export_torchscript(model, config, torchscript_dir, args.batch_size, args.seq_length, args.device)
+    
     if args.format in ["onnx", "all"]:
-        export_onnx(model, config, os.path.join(args.output_dir, "onnx"), 
-                  args.batch_size, args.seq_length, args.device)
+        try:
+            export_onnx(model, config, onnx_dir, args.batch_size, args.seq_length, args.device)
+        except Exception as e:
+            print(f"Warning: ONNX export failed: {e}")
+    
+    # Export quantized models if requested
+    if args.quantize != "none" or args.format in ["quantized", "all"]:
+        export_quantized(
+            model, 
+            config, 
+            quantized_dir, 
+            args.quantize if args.quantize != "none" else "both",
+            calibration_data=calibration_data,
+            device=args.device
+        )
+    
+    # Benchmark models if requested
+    if args.benchmark and args.quantize != "none":
+        benchmark_models(
+            model, 
+            config, 
+            quantized_dir, 
+            args.device, 
+            args.quantize,
+            batch_size=args.batch_size,
+            seq_length=args.seq_length
+        )
     
     # Verify model if requested
     if args.verify:
         verify_model(model, config, args.device, args.batch_size, args.seq_length)
     
-    # Generate text if requested
-    if args.generate:
+    # Generate text sample if requested
+    if args.generate and tokenizer:
         generate_text(model, config, args.device, args.prompt)
     
     print("\nModel export completed successfully!")
