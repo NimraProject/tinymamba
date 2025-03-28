@@ -296,3 +296,34 @@ wandb_run_name = "experiment-1"
 ## License
 
 [MIT License](LICENSE) 
+
+## TODO
+
+The following items are planned for future development:
+
+- Implement better error handling in RoPE embeddings to handle dimension mismatches
+- Add support for quantized models (INT8, INT4) for more efficient deployment
+- Create benchmarking scripts to compare against standard Transformer models
+- Integrate with HuggingFace's transformers library for better ecosystem compatibility
+- Implement parameter-efficient fine-tuning methods (LoRA, Prefix-tuning)
+- Add streaming inference support with proper state management
+
+## Next Steps
+
+Immediate next development priorities:
+
+1. **Robustness Improvements**:
+   - Fix dimension handling in rotary embeddings implementation
+   - Add more comprehensive test suite for all components
+   - Implement better error reporting during training
+
+2. **Performance Optimizations**:
+   - Profile and optimize the SSM computation kernels
+   - Reduce memory usage during training
+   - Investigate faster attention implementations
+
+3. **Deployment & Integration**:
+   - Create Docker containers for easy deployment
+   - Add Python package installation support
+   - Develop a simple API for inference
+   - Integrate with popular serving frameworks 
