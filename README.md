@@ -23,6 +23,11 @@ A hybrid state space model and attention-based architecture that combines elemen
   - Export to PyTorch, TorchScript, and ONNX formats
   - Optimization for inference
   - Simple tokenization support
+- **Advanced Features**:
+  - Parameter-efficient fine-tuning (LoRA, Prefix-tuning)
+  - Streaming inference with proper state management
+  - Quantization support for efficient deployment
+  - Integration with HuggingFace Transformers ecosystem
 
 ## Installation
 
@@ -190,6 +195,59 @@ Token Content → Lightweight Controller → Dynamic Branch Weights
 
 This allows the model to adaptively route information through different pathways (SSM, attention, MLP) based on token content.
 
+## Parameter-Efficient Fine-Tuning (PEFT)
+
+TinyMamba supports parameter-efficient fine-tuning methods to adapt pre-trained models to specific tasks with minimal additional parameters:
+
+### LoRA (Low-Rank Adaptation)
+
+```bash
+python peft.py --checkpoint ./tinymamba_model_latest.pt --method lora --lora_rank 8 --lora_alpha 16.0 --output_dir ./lora_model
+```
+
+### Prefix Tuning
+
+```bash
+python peft.py --checkpoint ./tinymamba_model_latest.pt --method prefix --prefix_length 16 --output_dir ./prefix_model
+```
+
+## Streaming Inference
+
+TinyMamba provides optimized streaming inference with proper state management for continuous text generation:
+
+```bash
+python streaming.py --checkpoint ./tinymamba_model_latest.pt --prompt "Once upon a time" --max_tokens 100 --streaming
+```
+
+### Multi-Session Support
+
+The streaming server supports multiple concurrent sessions with independent state management:
+
+```python
+from streaming import StreamingServer, StreamingConfig
+
+# Create server
+config = StreamingConfig()
+config.temperature = 0.8
+config.max_new_tokens = 50
+
+server = StreamingServer(
+    model_path="./tinymamba_model_latest.pt",
+    device="cuda"
+)
+
+# Create sessions
+session1 = server.create_session()
+session2 = server.create_session()
+
+# Generate text in different sessions (with different contexts)
+text1 = server.generate_text("Hello, my name is Alice.", session_id=session1)
+text2 = server.generate_text("The weather today is", session_id=session2)
+
+# Continue generation in a session (maintains state)
+text1_continued = server.generate_text("I live in", session_id=session1)
+```
+
 ## Customization
 
 ### Adding a Custom Tokenizer
@@ -249,53 +307,32 @@ train_dataset = StreamingTokenDataset(
 ```bash
 # Start TensorBoard
 tensorboard --logdir=./logs
-
-# Access in browser
-# http://localhost:6006
 ```
 
 ### Weights & Biases
 
-```python
-# In Config class:
-use_wandb = True
-wandb_project = "tinymamba"
-wandb_run_name = "experiment-1"
+Enable W&B logging by setting `use_wandb = True` in Config.
+
+## TODOs
+
+- [x] Add proper error handling for RoPE embeddings
+- [x] Implement support for quantized models (int8, int4)
+- [x] Create benchmarking scripts for performance measurement
+- [x] Integrate with HuggingFace's transformers library
+- [x] Implement parameter-efficient fine-tuning methods (LoRA, Prefix-tuning)
+- [x] Add streaming inference support with proper state management
+
+# For ONNX export
+
+TinyMamba models can be exported to ONNX format for deployment:
+
+```bash
+python export_model.py --checkpoint ./tinymamba_model_latest.pt --format onnx --output_dir ./onnx_models
 ```
-
-## Troubleshooting
-
-### Out of Memory Errors
-
-1. Reduce batch size and increase gradient accumulation steps
-2. Use a smaller model (reduce d_model, n_layer)
-3. Use a smaller context length (block_size)
-4. Enable mixed precision training
-
-### Training Instability
-
-1. Reduce learning rate
-2. Increase warmup steps
-3. Adjust weight decay
-4. Check for NaN/Inf values in the loss
-
-### Flash Attention Issues
-
-1. Make sure you have the latest flash-attn package
-2. Check compatibility with your CUDA version
-3. Fall back to standard attention with `use_flash_attn=False`
-
-## Performance Tips
-
-1. Use torch.compile for faster training
-2. Enable mixed precision with bfloat16/float16
-3. Use gradient accumulation for larger effective batch sizes
-4. Enable flash attention for faster attention computation
-5. Use a larger window_size for better performance on longer contexts
 
 ## License
 
-[MIT License](LICENSE) 
+MIT 
 
 ## TODO
 
